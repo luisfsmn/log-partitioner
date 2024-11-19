@@ -1,0 +1,200 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Partition the logs stored on S3 by day on Glue to optimize Athena queries performance and costs
+Parameters:
+  Region:
+    Type: String
+  LogBucket:
+    Type: String
+    Description:S3 log bucket
+  S3Output:
+    Type: String
+    Description: S3 location for Athena query results
+    Default: 's3://athena-data/'
+  DatabaseName:
+    Type: String
+    Description: Name of the Glue database
+    Default: 'applogs'
+  TableNames:
+    Type: CommaDelimitedList
+    Description: List of table names
+    Default: 'logs_apiaccess,logs_apiexecution,logs_ecs,logs_lambda,logs_rds'
+  Prefixes:
+    Type: CommaDelimitedList
+    Description: Corresponding list of S3 prefixes
+    Default: 'apiaccess/,apiexecution/,ecs/,lambda/,rds/'
+
+Resources:
+
+# Lambda Role
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "LambdaS3AthenaPermissions"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${LogBucket}"
+                  - !Sub "arn:aws:s3:::${LogBucket}/*"
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetPartitions
+                  - glue:BatchCreatePartition
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+
+  LogsPartitioner:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: 'LogsPartitioner'
+      Runtime: python3.12
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30 #Increase depending on execution time
+      Environment:
+        Variables:
+          REGION: !Sub ${Region}
+          S3_BUCKET_NAME: !Ref LogBucketName
+          S3_OUTPUT: !Ref S3Output
+          DATABASE_NAME: !Ref DatabaseName
+          TABLE_NAMES: !Join [",", !Ref TableNames]
+          PREFIXES: !Join [",", !Ref Prefixes]
+          START_DATE: !Sub ${AWS::StackName}_StartDate
+          END_DATE: !Sub ${AWS::StackName}_EndDate
+          BATCH_SIZE: '20'
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import boto3
+          from datetime import datetime, timedelta
+          import os
+          import time
+
+          # Load environment variables
+          REGION = os.environ['REGION']
+          S3_BUCKET_NAME = os.environ['S3_BUCKET_NAME']
+          S3_OUTPUT = os.environ['S3_OUTPUT']
+          DATABASE_NAME = os.environ['DATABASE_NAME']
+          TABLE_NAMES = os.environ['TABLE_NAMES'].split(',')
+          PREFIXES = os.environ['PREFIXES'].split(',')
+          START_DATE = datetime.strptime(os.environ.get('START_DATE', (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')), '%Y-%m-%d')
+          END_DATE = datetime.strptime(os.environ.get('END_DATE', datetime.now().strftime('%Y-%m-%d')), '%Y-%m-%d')
+          BATCH_SIZE = int(os.environ['BATCH_SIZE'])
+
+          athena_client = boto3.client('athena', region_name=REGION)
+          glue_client = boto3.client('glue', region_name=REGION)
+
+          def execute_athena_query(query, database_name):
+              """Execute a query in Athena and return the execution ID."""
+              try:
+                  response = athena_client.start_query_execution(
+                      QueryString=query,
+                      QueryExecutionContext={'Database': database_name},
+                      ResultConfiguration={'OutputLocation': S3_OUTPUT}
+                  )
+                  query_execution_id = response['QueryExecutionId']
+                  while True:
+                      query_status = athena_client.get_query_execution(QueryExecutionId=query_execution_id)
+                      status = query_status['QueryExecution']['Status']['State']
+                      if status in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
+                          break
+                      time.sleep(1)
+                  if status != 'SUCCEEDED':
+                      raise Exception(f"Query failed: {query_status['QueryExecution']['Status']['StateChangeReason']}")
+                  return query_execution_id
+              except Exception as e:
+                  print(f"Error executing query: {e}")
+                  raise
+
+          def partition_exists(table_name, year, month, day):
+              """Check if a partition exists."""
+              try:
+                  response = glue_client.get_partitions(
+                      DatabaseName=DATABASE_NAME,
+                      TableName=table_name,
+                      Expression=f"year='{year}' AND month='{month}' AND day='{day}'"
+                  )
+                  return bool(response['Partitions'])
+              except Exception as e:
+                  print(f"Error checking partition: {e}")
+                  return False
+
+          def add_partition(table_name, year, month, day, s3_prefix):
+              """Add a partition."""
+              s3_location = f"s3://{S3_BUCKET_NAME}/{s3_prefix}{year}/{month}/{day}/"
+              query = f"ALTER TABLE {table_name} ADD PARTITION (year='{year}', month='{month}', day='{day}') LOCATION '{s3_location}'"
+              execute_athena_query(query, DATABASE_NAME)
+
+          def repair_table(table_name):
+              """Repair table."""
+              query = f"MSCK REPAIR TABLE {table_name}"
+              execute_athena_query(query, DATABASE_NAME)
+
+          def process_batch(batch):
+              for table_name, year, month, day, s3_prefix in batch:
+                  if not partition_exists(table_name, year, month, day):
+                      add_partition(table_name, year, month, day, s3_prefix)
+                  time.sleep(1)
+              unique_tables = set(table_name for table_name, _, _, _, _ in batch)
+              for table_name in unique_tables:
+                  repair_table(table_name)
+
+          def lambda_handler(event, context):
+              current_date = START_DATE
+              batch = []
+              while current_date <= END_DATE:
+                  year = current_date.strftime('%Y')
+                  month = current_date.strftime('%m')
+                  day = current_date.strftime('%d')
+                  for table_name, prefix in zip(TABLE_NAMES, PREFIXES):
+                      if not partition_exists(table_name, year, month, day):
+                          batch.append((table_name, year, month, day, prefix))
+                      if len(batch) == BATCH_SIZE:
+                          process_batch(batch)
+                          batch = []
+                  current_date += timedelta(days=1)
+              if batch:
+                  process_batch(batch)
+              return {'statusCode': 200, 'body': 'Partition processing complete'}
+      Description: Function to check and create new daily partitions at Athena log tables.
+      TracingConfig:
+        Mode: Active
+
+#Triggers
+
+  DailyPartitionerTask:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Description: 'Daily partitions the logs on Athena'
+      Name: 'LogsPartitionerTask'
+      State: ENABLED
+      ScheduleExpression: cron(0 12 ? * * *)
+      Targets:
+        - Arn: !GetAtt LogsPartitioner.Arn
+          Id: 'AutoPartitionAthena'
+  DailyPartitionerRulePermission:
+    Type: AWS::Lambda::Permissions
+    Properties:
+      FunctionName: !Ref LogsPartitioner
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/*
